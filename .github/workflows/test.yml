@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -e ".[test]" mypy ruff
+
+      - name: Lint (ruff)
+        run: ruff check
+
+      - name: Type-check (mypy)
+        run: mypy --config-file ./mypy.ini cupdate
+
+      - name: Unit tests
+        run: python -m pytest || [ $? -eq 5 ]
