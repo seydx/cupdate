@@ -36,6 +36,7 @@ cupdate
 ## Features
 
 - **Smart Updates** - Preserves version operators (>=, <=, ==)
+- **In-place Rewrites** - Only the version number changes, environment markers, comments and order stay
 - **Package Exclusions** - Skip specific packages from updates
 - **Release Information** - Shows package age and project URLs
 - **Formatted Output** - Clean table display of updates
@@ -79,8 +80,22 @@ Works with standard `requirements.txt` format:
 ```
 # requirements.txt
 requests==2.28.1
-flask>=2.2.0
+flask[async]>=2.2.0
 numpy<=1.24.0
+onnxruntime==1.29.0; platform_machine != "x86_64"
+```
+
+Only the version number of a pinned requirement is replaced. Everything around it
+is written back byte for byte, including environment markers, extras, inline
+comments, blank lines, line order and CRLF endings.
+
+Lines that do not pin a single version are left alone and never looked up:
+
+```
+-r base.txt
+--index-url https://example.com/simple
+numpy>=2.0,<3
+hailort @ https://example.com/hailort-4.21.0.whl ; platform_machine == "aarch64"
 pandas
 ```
 
