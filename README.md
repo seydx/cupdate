@@ -33,6 +33,16 @@ Then run:
 cupdate
 ```
 
+### With a Cooldown
+
+Only take releases that are at least some days old, so a hijacked release has time to be found and pulled before it lands in your pins:
+
+```bash
+cupdate --cooldown 7 --cooldown-exclude 'my-org-*'
+```
+
+A package with no release old enough stays where it is, and a package never moves below its current pin. `--cooldown-exclude` takes a glob and can be repeated, for your own packages that should update at once.
+
 ## Features
 
 - **Smart Updates** - Preserves version operators (>=, <=, ==)
@@ -104,6 +114,9 @@ pandas
 ```bash
 # Update requirements in current directory
 cupdate
+
+# Only releases at least 7 days old, own packages excepted
+cupdate --cooldown 7 --cooldown-exclude 'my-org-*'
 
 # The tool automatically looks for:
 # - requirements.txt (required)

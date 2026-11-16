@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def offline(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake(packages: list[str]) -> dict[str, dict[str, str]]:
+    def fake(packages: list[str], *_: object) -> dict[str, dict[str, str]]:
         return {p: {"version": "9.9.9", "url": "", "age": ""} for p in packages}
 
     monkeypatch.setattr(cupdate, "get_latest_versions", fake)
@@ -96,3 +97,31 @@ def test_read_requirements_reports_markers_free_versions(tmp_path: Path) -> None
         "onnxruntime": "1.29.0",
         "aiohttp": ">=3.14.3",
     }
+
+
+def releases(**ages: int) -> dict[str, list[dict[str, str]]]:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    return {
+        version: [{"upload_time": (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")}]
+        for version, days in ages.items()
+    }
+
+
+def test_cooldown_takes_newest_old_enough_release() -> None:
+    uploads = releases(**{"3.0.0": 1, "2.9.0": 5, "2.8.0": 20})
+    assert cupdate.pick_version(["3.0.0", "2.9.0", "2.8.0"], uploads, 7) == "2.8.0"
+    assert cupdate.pick_version(["3.0.0", "2.9.0", "2.8.0"], uploads, 0) == "3.0.0"
+
+
+def test_cooldown_never_goes_below_current() -> None:
+    uploads = releases(**{"3.0.0": 1, "2.9.0": 2, "2.8.0": 20})
+    assert cupdate.pick_version(["3.0.0", "2.9.0", "2.8.0"], uploads, 7, "2.9.0") == "2.9.0"
+
+
+def test_cooldown_without_old_enough_release_skips() -> None:
+    assert cupdate.pick_version(["1.0.0"], releases(**{"1.0.0": 1}), 7) is None
+
+
+def test_cooldown_exclude_matches_normalized_names() -> None:
+    assert cupdate._skips_cooldown("camera_ui_sdk", ["camera-ui-*"])
+    assert not cupdate._skips_cooldown("numpy", ["camera-ui-*"])

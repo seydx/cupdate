@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import os
 import re
 import subprocess
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from fnmatch import fnmatch
 from typing import Any
 
 import requests
@@ -60,69 +63,99 @@ def read_excluded_packages(config_path: str) -> set[str]:
     return excluded
 
 
-def get_latest_versions(packages: list[str]) -> dict[str, dict[str, str]]:
-    """Determine the latest versions for a list of packages with additional information."""
+def get_latest_versions(
+    packages: list[str],
+    cooldown_days: int = 0,
+    cooldown_exclude: Sequence[str] = (),
+    current: dict[str, str] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Determine the version to update to for each package, with project URL and release age.
+
+    With a cooldown only releases at least that many days old count, and a package
+    never moves below its current version.
+    """
     package_info: dict[str, dict[str, str]] = {}
 
     for package in packages:
         try:
-            # Get latest version
             result = subprocess.run(
                 ["pip", "index", "versions", package], capture_output=True, text=True, check=True
             )
-            output = result.stdout
-
-            version_match = re.search(r"Available versions:\s*([^\s,]+)", output)
-            latest_version = version_match.group(1) if version_match else None
-
-            if latest_version:
-                # Get package info from PyPI
-                try:
-                    response = requests.get(f"https://pypi.org/pypi/{package}/json", timeout=5)
-                    if response.status_code == 200:
-                        pypi_data = response.json()
-
-                        # Get project URL
-                        project_url = (
-                            pypi_data.get("info", {}).get("project_urls", {}).get("Homepage")
-                            or pypi_data.get("info", {}).get("home_page")
-                            or f"https://pypi.org/project/{package}/"
-                        )
-
-                        # Calculate release age
-                        release_date = None
-                        release_info: list[dict[str, str]] = pypi_data.get("releases", {}).get(
-                            latest_version, []
-                        )
-                        if release_info and len(release_info) > 0:
-                            upload_time = release_info[0].get("upload_time")
-                            if upload_time:
-                                try:
-                                    release_date = datetime.strptime(upload_time, "%Y-%m-%dT%H:%M:%S")
-                                except ValueError:
-                                    with contextlib.suppress(ValueError):
-                                        release_date = datetime.strptime(upload_time, "%Y-%m-%dT%H:%M:%S.%f")
-
-                        age = _calculate_age(release_date)
-                        package_info[package] = {"version": latest_version, "url": project_url, "age": age}
-                    else:
-                        package_info[package] = {
-                            "version": latest_version,
-                            "url": f"https://pypi.org/project/{package}/",
-                            "age": "",
-                        }
-                except Exception as e:
-                    print(f"Warning: Error getting info for {package}: {e!s}")
-                    package_info[package] = {
-                        "version": latest_version,
-                        "url": f"https://pypi.org/project/{package}/",
-                        "age": "",
-                    }
-
         except subprocess.SubprocessError:
             print(f"Warning: Could not determine latest version for {package}.")
+            continue
+
+        versions_match = re.search(r"Available versions:\s*(.+)", result.stdout)
+        available = [v.strip() for v in versions_match.group(1).split(",")] if versions_match else []
+        if not available:
+            continue
+
+        pypi_data: dict[str, Any] = {}
+        try:
+            response = requests.get(f"https://pypi.org/pypi/{package}/json", timeout=5)
+            if response.status_code == 200:
+                pypi_data = response.json()
+        except Exception as e:
+            print(f"Warning: Error getting info for {package}: {e!s}")
+
+        releases: dict[str, list[dict[str, str]]] = pypi_data.get("releases", {})
+        wait = 0 if _skips_cooldown(package, cooldown_exclude) else cooldown_days
+        version = pick_version(available, releases, wait, (current or {}).get(package))
+        if not version:
+            continue
+
+        info = pypi_data.get("info", {})
+        project_url = (
+            (info.get("project_urls") or {}).get("Homepage")
+            or info.get("home_page")
+            or f"https://pypi.org/project/{package}/"
+        )
+        package_info[package] = {
+            "version": version,
+            "url": project_url,
+            "age": _calculate_age(_upload_date(releases, version)),
+        }
 
     return package_info
+
+
+def pick_version(
+    available: list[str],
+    releases: dict[str, list[dict[str, str]]],
+    cooldown_days: int,
+    current: str | None = None,
+) -> str | None:
+    """Return the newest of the available versions (newest first) old enough for the cooldown."""
+    if cooldown_days <= 0:
+        return available[0]
+
+    cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=cooldown_days)
+    for version in available:
+        if version == current:
+            return current
+        released = _upload_date(releases, version)
+        if released and released <= cutoff:
+            return version
+
+    return None
+
+
+def _skips_cooldown(package: str, patterns: Sequence[str]) -> bool:
+    name = re.sub(r"[-_.]+", "-", package).lower()
+    return any(fnmatch(name, pattern.lower()) for pattern in patterns)
+
+
+def _upload_date(releases: dict[str, list[dict[str, str]]], version: str) -> datetime | None:
+    files = releases.get(version) or []
+    upload_time = files[0].get("upload_time") if files else None
+    if not upload_time:
+        return None
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        with contextlib.suppress(ValueError):
+            return datetime.strptime(upload_time, fmt)
+
+    return None
 
 
 def _calculate_age(release_date: datetime | None) -> str:
@@ -154,7 +187,12 @@ def _calculate_age(release_date: datetime | None) -> str:
         return f"{years} {'year' if years == 1 else 'years'}"
 
 
-def update_requirements(requirements_path: str, config_path: str | None = None) -> None:
+def update_requirements(
+    requirements_path: str,
+    config_path: str | None = None,
+    cooldown_days: int = 0,
+    cooldown_exclude: Sequence[str] = (),
+) -> None:
     """Update requirements.txt with the latest versions, except for excluded packages."""
     with open(requirements_path, newline="") as file:
         lines = file.readlines()
@@ -168,7 +206,8 @@ def update_requirements(requirements_path: str, config_path: str | None = None) 
             pins.append((index, match))
 
     packages_to_update: list[str] = list(dict.fromkeys(match.group("name") for _, match in pins))
-    latest_packages_info = get_latest_versions(packages_to_update)
+    current = {match.group("name"): match.group("version") for _, match in pins}
+    latest_packages_info = get_latest_versions(packages_to_update, cooldown_days, cooldown_exclude, current)
 
     update_table: list[Any] = []
 
@@ -211,7 +250,7 @@ def update_requirements(requirements_path: str, config_path: str | None = None) 
     )
 
 
-def main() -> None:
+def main(cooldown_days: int = 0, cooldown_exclude: Sequence[str] = ()) -> None:
     """Main function that is executed when the command is called."""
     cwd = os.getcwd()
     requirements_path = os.path.join(cwd, "requirements.txt")
@@ -229,13 +268,32 @@ def main() -> None:
         if excluded:
             print(f"Note: {len(excluded)} package(s) excluded from update.")
 
-    update_requirements(requirements_path, config_path if config_exists else None)
+    if cooldown_days > 0:
+        print(f"Note: only releases at least {cooldown_days} days old are taken.")
+
+    update_requirements(
+        requirements_path, config_path if config_exists else None, cooldown_days, cooldown_exclude
+    )
 
 
 def cli_main() -> None:
     """CLI entry point."""
-    main()
+    parser = argparse.ArgumentParser(
+        prog="cupdate", description="Update the pinned versions in requirements.txt."
+    )
+    parser.add_argument(
+        "--cooldown", type=int, default=0, metavar="DAYS", help="only take releases at least DAYS old"
+    )
+    parser.add_argument(
+        "--cooldown-exclude",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="packages that skip the cooldown, as a glob like 'my-org-*' (repeatable)",
+    )
+    args = parser.parse_args()
+    main(args.cooldown, args.cooldown_exclude)
 
 
 if __name__ == "__main__":
-    main()
+    cli_main()
